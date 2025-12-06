@@ -5,7 +5,8 @@ Microservice ini menyediakan REST API untuk inference model lead scoring.
 
 Endpoints:
 - GET /health: Health check
-- POST /score: Lead scoring inference
+- POST /score: Lead scoring inference (single record)
+- POST /bulk-score: Bulk lead scoring inference (CSV upload, max 1000 rows)
 
 Run server:
     uvicorn main:app --reload --port 8000
@@ -13,13 +14,16 @@ Run server:
 Test endpoints:
     curl http://localhost:8000/health
     curl -X POST http://localhost:8000/score -H "Content-Type: application/json" -d @sample_request.json
+    curl -X POST http://localhost:8000/bulk-score -F "file=@leads.csv"
 """
 
 import logging
+import io
 from contextlib import asynccontextmanager
-from typing import List, Literal
+from typing import List, Literal, Optional
 
-from fastapi import FastAPI, Request
+import pandas as pd
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ConfigDict
@@ -29,6 +33,12 @@ from inference_service import (
     run_inference,
     InferenceError,
     Artifacts,
+    # Bulk inference imports
+    MAX_BULK_ROWS,
+    REQUIRED_INPUT_FIELDS,
+    validate_dataframe_columns,
+    clean_dataframe,
+    run_bulk_inference,
 )
 
 
@@ -197,6 +207,89 @@ class HealthResponse(BaseModel):
 
 
 # =============================================================================
+# BULK INFERENCE PYDANTIC MODELS
+# =============================================================================
+
+class InvalidRow(BaseModel):
+    """Model untuk baris yang tidak valid/di-drop."""
+    row_index: int = Field(..., description="Index baris asli dalam CSV (0-based)")
+    reason: str = Field(..., description="Alasan baris di-drop")
+
+
+class BulkReasonCode(BaseModel):
+    """Model untuk single reason code dalam bulk response."""
+    feature: str = Field(..., description="Nama fitur yang berpengaruh")
+    direction: Literal["positive", "negative"] = Field(..., description="Arah kontribusi")
+    shap_value: float = Field(..., description="Nilai SHAP (importance)")
+
+
+class BulkPrediction(BaseModel):
+    """Model untuk single prediction dalam bulk response."""
+    row_index: int = Field(..., description="Index baris asli dalam CSV (0-based)")
+    probability: float = Field(..., ge=0.0, le=1.0, description="Probabilitas subscribe")
+    prediction: Literal[0, 1] = Field(..., description="Prediksi binary")
+    prediction_label: Literal["yes", "no"] = Field(..., description="Label prediksi")
+    risk_level: Literal["Low", "Medium", "High"] = Field(..., description="Level konversi")
+    reason_codes: List[BulkReasonCode] = Field(..., description="Top 5 fitur paling berpengaruh")
+
+
+class BulkSummary(BaseModel):
+    """Model untuk summary statistik bulk inference."""
+    total_rows: int = Field(..., description="Total baris dalam CSV")
+    processed_rows: int = Field(..., description="Jumlah baris yang berhasil diproses")
+    dropped_rows: int = Field(..., description="Jumlah baris yang di-drop")
+    avg_probability: Optional[float] = Field(None, description="Rata-rata probability")
+    conversion_high: int = Field(..., description="Jumlah High conversion")
+    conversion_medium: int = Field(..., description="Jumlah Medium conversion")
+    conversion_low: int = Field(..., description="Jumlah Low conversion")
+
+
+class BulkScoreResponse(BaseModel):
+    """Response model untuk bulk scoring."""
+    success: bool = Field(..., description="Apakah request berhasil")
+    summary: BulkSummary = Field(..., description="Summary statistik")
+    invalid_rows: List[InvalidRow] = Field(default=[], description="Daftar baris yang tidak valid")
+    predictions: List[BulkPrediction] = Field(default=[], description="Hasil prediksi per baris")
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "success": True,
+                "summary": {
+                    "total_rows": 100,
+                    "processed_rows": 95,
+                    "dropped_rows": 5,
+                    "avg_probability": 0.234,
+                    "conversion_high": 15,
+                    "conversion_medium": 30,
+                    "conversion_low": 50
+                },
+                "invalid_rows": [
+                    {"row_index": 5, "reason": "missing_values: age, balance"},
+                    {"row_index": 12, "reason": "invalid_numeric: balance"}
+                ],
+                "predictions": [
+                    {
+                        "row_index": 0,
+                        "probability": 0.78,
+                        "prediction": 1,
+                        "prediction_label": "yes",
+                        "risk_level": "High",
+                        "reason_codes": [
+                            {"feature": "poutcome", "direction": "positive", "shap_value": 0.45},
+                            {"feature": "contact", "direction": "positive", "shap_value": 0.28},
+                            {"feature": "housing", "direction": "negative", "shap_value": -0.22},
+                            {"feature": "balance", "direction": "positive", "shap_value": 0.17},
+                            {"feature": "month", "direction": "negative", "shap_value": -0.15}
+                        ]
+                    }
+                ]
+            }
+        }
+    )
+
+
+# =============================================================================
 # EXCEPTION HANDLERS
 # =============================================================================
 
@@ -252,6 +345,7 @@ async def root():
         "endpoints": {
             "health": "/health",
             "score": "/score",
+            "bulk_score": "/bulk-score",
             "docs": "/docs",
             "redoc": "/redoc"
         }
@@ -315,6 +409,237 @@ async def score_lead(features: LeadFeatures):
     logger.info(f"Inference complete: probability={result['probability']:.4f}, prediction={result['prediction_label']}")
     
     return InferenceResult(**result)
+
+
+@app.post("/bulk-score", response_model=BulkScoreResponse, tags=["Inference"])
+async def bulk_score_leads(file: UploadFile = File(..., description="CSV file containing leads data")):
+    """
+    Bulk lead scoring inference endpoint.
+    
+    Menerima file CSV berisi multiple customer records dan mengembalikan
+    hasil scoring untuk setiap baris yang valid.
+    
+    Parameters
+    ----------
+    file : UploadFile
+        CSV file dengan kolom yang sesuai dengan REQUIRED_COLUMNS
+    
+    Returns
+    -------
+    BulkScoreResponse
+        Hasil inference untuk semua baris valid, plus summary dan invalid rows
+    
+    Raises
+    ------
+    400
+        - File bukan CSV
+        - File kosong
+        - Melebihi MAX_BULK_ROWS (1000 baris)
+        - Missing required columns
+    500
+        Jika terjadi error saat inference
+    
+    Notes
+    -----
+    - Max 1000 rows per request
+    - Baris dengan missing values akan di-drop dan dilaporkan di invalid_rows
+    - Kolom yang tidak dikenal akan diabaikan (hanya log warning)
+    """
+    # Check if model loaded
+    if artifacts is None:
+        raise InferenceError("Model artifacts not loaded")
+    
+    # Validate file type
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Invalid file type",
+                "message": "Only CSV files are accepted",
+                "filename": file.filename
+            }
+        )
+    
+    logger.info(f"Processing bulk inference request: {file.filename}")
+    
+    try:
+        # Read file content
+        content = await file.read()
+        if not content:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Empty file",
+                    "message": "Uploaded CSV file is empty"
+                }
+            )
+        
+        # Parse CSV
+        try:
+            df = pd.read_csv(io.StringIO(content.decode('utf-8')))
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "CSV parsing error",
+                    "message": f"Failed to parse CSV: {str(e)}"
+                }
+            )
+        
+        total_rows = len(df)
+        logger.info(f"CSV loaded: {total_rows} rows, {len(df.columns)} columns")
+        
+        # Validate row count
+        if total_rows == 0:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Empty CSV",
+                    "message": "CSV file contains no data rows"
+                }
+            )
+        
+        if total_rows > MAX_BULK_ROWS:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Too many rows",
+                    "message": f"CSV contains {total_rows} rows, maximum allowed is {MAX_BULK_ROWS}",
+                    "max_rows": MAX_BULK_ROWS
+                }
+            )
+        
+        # Validate columns
+        validation_result = validate_dataframe_columns(df)
+        missing_cols = validation_result["missing_columns"]
+        extra_cols = validation_result["extra_columns"]
+        
+        if missing_cols:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Missing required columns",
+                    "message": f"CSV is missing required columns: {missing_cols}",
+                    "missing_columns": missing_cols,
+                    "required_columns": REQUIRED_INPUT_FIELDS
+                }
+            )
+        
+        if extra_cols:
+            logger.warning(f"CSV contains extra columns that will be ignored: {extra_cols}")
+        
+        # Clean dataframe (handle missing values and invalid data)
+        clean_result = clean_dataframe(df)
+        cleaned_df = clean_result["cleaned_df"]
+        original_indices = clean_result["original_indices"]
+        dropped_indices = clean_result["dropped_indices"]
+        invalid_rows_data = clean_result["invalid_rows"]
+        
+        processed_rows = len(cleaned_df)
+        dropped_rows = len(dropped_indices)
+        
+        logger.info(f"Data cleaning complete: {processed_rows} valid rows, {dropped_rows} dropped")
+        
+        # Build invalid rows response - combine dropped (missing values) with invalid (parsing errors)
+        invalid_rows_response = []
+        
+        # Add dropped rows (missing values)
+        for idx in dropped_indices:
+            # Find which columns had missing values
+            row = df.iloc[idx]
+            missing_cols_in_row = [col for col in REQUIRED_INPUT_FIELDS if pd.isnull(row.get(col))]
+            invalid_rows_response.append(
+                InvalidRow(row_index=int(idx), reason=f"missing_values: {', '.join(missing_cols_in_row)}")
+            )
+        
+        # Add invalid rows (parsing errors)
+        for row_info in invalid_rows_data:
+            invalid_rows_response.append(
+                InvalidRow(row_index=row_info["row_index"], reason=row_info["reason"])
+            )
+        
+        # If no valid rows after cleaning
+        if processed_rows == 0:
+            return BulkScoreResponse(
+                success=True,
+                summary=BulkSummary(
+                    total_rows=total_rows,
+                    processed_rows=0,
+                    dropped_rows=dropped_rows,
+                    avg_probability=None,
+                    conversion_high=0,
+                    conversion_medium=0,
+                    conversion_low=0
+                ),
+                invalid_rows=invalid_rows_response,
+                predictions=[]
+            )
+        
+        # Run bulk inference (original_indices already from clean_result)
+        results = run_bulk_inference(cleaned_df, original_indices, artifacts)
+        
+        # Build predictions response
+        predictions_response = []
+        conversion_counts = {"High": 0, "Medium": 0, "Low": 0}
+        total_probability = 0.0
+        
+        for result in results:
+            # Convert reason codes
+            reason_codes = [
+                BulkReasonCode(
+                    feature=rc["feature"],
+                    direction=rc["direction"],
+                    shap_value=rc["shap_value"]
+                )
+                for rc in result["reason_codes"]
+            ]
+            
+            prediction = BulkPrediction(
+                row_index=result["row_index"],
+                probability=result["probability"],
+                prediction=result["prediction"],
+                prediction_label=result["prediction_label"],
+                risk_level=result["risk_level"],
+                reason_codes=reason_codes
+            )
+            predictions_response.append(prediction)
+            
+            # Update stats
+            conversion_counts[result["risk_level"]] += 1
+            total_probability += result["probability"]
+        
+        avg_probability = total_probability / processed_rows if processed_rows > 0 else None
+        
+        logger.info(
+            f"Bulk inference complete: "
+            f"High={conversion_counts['High']}, "
+            f"Medium={conversion_counts['Medium']}, "
+            f"Low={conversion_counts['Low']}, "
+            f"avg_prob={avg_probability:.4f}" if avg_probability else ""
+        )
+        
+        return BulkScoreResponse(
+            success=True,
+            summary=BulkSummary(
+                total_rows=total_rows,
+                processed_rows=processed_rows,
+                dropped_rows=dropped_rows,
+                avg_probability=round(avg_probability, 4) if avg_probability else None,
+                conversion_high=conversion_counts["High"],
+                conversion_medium=conversion_counts["Medium"],
+                conversion_low=conversion_counts["Low"]
+            ),
+            invalid_rows=invalid_rows_response,
+            predictions=predictions_response
+        )
+        
+    except HTTPException:
+        raise
+    except InferenceError:
+        raise
+    except Exception as e:
+        logger.error(f"Bulk inference error: {e}", exc_info=True)
+        raise InferenceError(f"Bulk inference failed: {str(e)}")
 
 
 # =============================================================================
