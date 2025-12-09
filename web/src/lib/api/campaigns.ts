@@ -10,18 +10,25 @@ import type {
  * Get all campaigns ordered by creation date (newest first).
  * 
  * @param limit - Maximum number of campaigns to return (default: 50)
+ * @param createdBy - Optional filter by user ID
  * @returns Array of campaign summaries
  */
-export async function getCampaigns(limit = 50): Promise<CampaignSummary[]> {
+export async function getCampaigns(limit = 50, createdBy?: string): Promise<CampaignSummary[]> {
   const supabase = await createClient();
 
-  const { data, error } = await supabase
+  let query = supabase
     .from("campaign_runs")
     .select(
       "id, name, source_filename, total_rows, processed_rows, avg_probability, status, created_by, created_at"
     )
     .order("created_at", { ascending: false })
     .limit(limit);
+
+  if (createdBy) {
+    query = query.eq("created_by", createdBy);
+  }
+
+  const { data, error } = await query;
 
   if (error) {
     console.error("Error fetching campaigns:", error);
