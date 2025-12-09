@@ -31,19 +31,15 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
 
     // Parse query parameters
     const searchParams = request.nextUrl.searchParams;
-    const queryParams = {
-      page: searchParams.get("page"),
-      pageSize: searchParams.get("pageSize"),
-      riskLevel: searchParams.get("riskLevel"),
-      minProbability: searchParams.get("minProbability"),
-      maxProbability: searchParams.get("maxProbability"),
-      job: searchParams.get("job"),
-      education: searchParams.get("education"),
-      marital: searchParams.get("marital"),
-      contact: searchParams.get("contact"),
-      sortBy: searchParams.get("sortBy"),
-      sortOrder: searchParams.get("sortOrder"),
-    };
+    const queryParams: Record<string, string> = {};
+    
+    // Only include params that are present
+    const paramKeys = ['page', 'pageSize', 'riskLevel', 'minProbability', 'maxProbability', 
+                       'job', 'education', 'sortBy', 'sortOrder'];
+    paramKeys.forEach(key => {
+      const value = searchParams.get(key);
+      if (value !== null) queryParams[key] = value;
+    });
 
     // Validate query params
     const validationResult = CompleteLeadQuerySchema.safeParse(queryParams);

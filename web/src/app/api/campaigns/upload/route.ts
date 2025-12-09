@@ -43,7 +43,12 @@ export async function POST(request: NextRequest) {
     }
 
     // Validate file type
-    if (!file.type.includes("csv") && !file.type.includes("excel")) {
+    const isCSV = file.type.includes("csv") || 
+                  file.type.includes("excel") || 
+                  file.type === "text/plain" ||
+                  file.name.endsWith(".csv");
+    
+    if (!isCSV) {
       return apiError("File must be a CSV", 400);
     }
 

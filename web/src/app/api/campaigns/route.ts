@@ -19,8 +19,8 @@ export async function GET(request: NextRequest) {
     // Parse query parameters
     const searchParams = request.nextUrl.searchParams;
     const queryParams = {
-      limit: searchParams.get("limit"),
-      createdBy: searchParams.get("createdBy"),
+      ...(searchParams.get("limit") && { limit: searchParams.get("limit") }),
+      ...(searchParams.get("createdBy") && { createdBy: searchParams.get("createdBy") }),
     };
 
     // Validate query params

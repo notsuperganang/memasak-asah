@@ -22,7 +22,7 @@ export const UpdateUserSchema = z.object({
 // User query params
 export const UserQuerySchema = z.object({
   role: UserRoleSchema.optional(),
-  limit: z.coerce.number().int().positive().max(100).optional().default(50),
+  limit: z.string().optional().default("50").transform(val => parseInt(val)).pipe(z.number().int().positive().max(100)),
 });
 
 // Username availability check

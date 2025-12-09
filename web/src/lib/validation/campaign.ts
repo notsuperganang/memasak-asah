@@ -47,7 +47,7 @@ export const UpdateCampaignSchema = z.object({
 
 // Campaign query params
 export const CampaignQuerySchema = z.object({
-  limit: z.coerce.number().int().positive().max(100).optional().default(50),
+  limit: z.string().optional().default("50").transform(val => parseInt(val)).pipe(z.number().int().positive().max(100)),
   createdBy: z.string().uuid().optional(),
 });
 

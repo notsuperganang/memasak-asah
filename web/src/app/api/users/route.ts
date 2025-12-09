@@ -23,10 +23,9 @@ export async function GET(request: NextRequest) {
 
     // Parse query parameters
     const searchParams = request.nextUrl.searchParams;
-    const queryParams = {
-      role: searchParams.get("role"),
-      limit: searchParams.get("limit"),
-    };
+    const queryParams: Record<string, string> = {};
+    if (searchParams.get("role")) queryParams.role = searchParams.get("role")!;
+    if (searchParams.get("limit")) queryParams.limit = searchParams.get("limit")!;
 
     // Validate query params
     const validationResult = UserQuerySchema.safeParse(queryParams);
