@@ -47,6 +47,7 @@ venv.bak/
 .env
 .env.local
 .env.*.local
+!.env.example
 
 # ML / Data Science
 *.pkl
@@ -77,3 +78,5 @@ htmlcov/
 tmp/
 temp/
 *.tmp
+
+ml/vercel-sa-key.json

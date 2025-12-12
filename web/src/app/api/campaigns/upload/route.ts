@@ -5,6 +5,7 @@ import { getCurrentUser } from "@/lib/api/users";
 import { createCampaign, updateCampaign } from "@/lib/api/campaigns";
 import { bulkInsertLeads } from "@/lib/api/leads";
 import { REQUIRED_CSV_COLUMNS } from "@/lib/validation";
+import { getCloudRunHeaders } from "@/lib/utils/cloud-run-auth";
 
 // ML Service configuration
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || "http://localhost:8000";
@@ -110,7 +111,7 @@ export async function POST(request: NextRequest) {
 
     // Parse headers with detected delimiter
     const headerLine = lines[0];
-    const headers = parseCSVLine(headerLine, delimiter)
+    const headers: string[] = parseCSVLine(headerLine, delimiter)
       .map((h) => h.toLowerCase().replace(/"/g, '').trim());
 
     console.log("Parsed headers:", headers);
@@ -180,8 +181,14 @@ export async function POST(request: NextRequest) {
       const blob = new Blob([processedContent], { type: "text/csv" });
       mlFormData.append("file", blob, file.name);
 
+      // Get authentication headers for Cloud Run
+      const authHeaders = await getCloudRunHeaders(ML_SERVICE_URL, "multipart/form-data");
+      // Remove Content-Type header for multipart/form-data (browser will set it with boundary)
+      delete authHeaders["Content-Type"];
+
       const mlResponse = await fetch(`${ML_SERVICE_URL}/bulk-score`, {
         method: "POST",
+        headers: authHeaders,
         body: mlFormData,
       });
 
@@ -206,7 +213,7 @@ export async function POST(request: NextRequest) {
         
         // Map values to columns
         const rowData: any = {};
-        headers.forEach((header, idx) => {
+        headers.forEach((header: string, idx: number) => {
           rowData[header] = values[idx]?.replace(/"/g, '').trim();
         });
 

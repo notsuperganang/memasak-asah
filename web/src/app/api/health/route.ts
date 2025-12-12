@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { apiSuccess, apiError } from "@/lib/utils/api";
+import { getCloudRunHeaders } from "@/lib/utils/cloud-run-auth";
 
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || "http://localhost:8000";
 
@@ -9,9 +10,13 @@ const ML_SERVICE_URL = process.env.ML_SERVICE_URL || "http://localhost:8000";
  */
 export async function GET(request: NextRequest) {
   try {
+    // Get authentication headers for Cloud Run
+    const headers = await getCloudRunHeaders(ML_SERVICE_URL);
+
     // Check ML service health
     const mlHealthResponse = await fetch(`${ML_SERVICE_URL}/health`, {
       method: "GET",
+      headers,
       signal: AbortSignal.timeout(5000), // 5 second timeout
     });
 

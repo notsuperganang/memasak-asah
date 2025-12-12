@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { apiSuccess, apiError, handleApiError } from "@/lib/utils/api";
 import { getCurrentUser } from "@/lib/api/users";
 import { SingleInferenceSchema } from "@/lib/validation";
+import { getCloudRunHeaders } from "@/lib/utils/cloud-run-auth";
 
 const ML_SERVICE_URL = process.env.ML_SERVICE_URL || "http://localhost:8000";
 
@@ -31,11 +32,12 @@ export async function POST(request: NextRequest) {
 
     // Send to ML service for scoring
     try {
+      // Get authentication headers for Cloud Run
+      const headers = await getCloudRunHeaders(ML_SERVICE_URL);
+
       const mlResponse = await fetch(`${ML_SERVICE_URL}/score`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers,
         body: JSON.stringify(leadData),
       });
 
